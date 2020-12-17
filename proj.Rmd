@@ -1,0 +1,581 @@
+---
+title: "CMPT 652: Final Project on Firewall Logs"
+output: html_notebook
+editor_options: 
+  chunk_output_type: inline
+---
+
+```{r}
+logs <- read.csv("/home/pallavi/git/course/statistics/final_project/data/log2.csv")
+print(head(logs))
+
+# re-arrange dataframe with Action in 1
+data <- logs[, c(5,1,2,3,4,6,7,8,9,10,11,12)]
+print(summary(data$Action))
+class(data$Action)
+
+# checked if there were duplicates - not many
+uniq <- unique(data[,1:12])
+nrow(uniq)
+
+summary(data$Action)
+```
+## Undersampling the 1st class
+
+```{r}
+library(caret)
+library(DMwR)
+
+# SMOTE
+set.seed(8654227, kind="Mersenne-Twister")
+smote.1 <- SMOTE(Action~., data=data, perc.over = 200, perc.under=850)
+summary(smote.1$Action)
+
+down.sampled <- downSample(x = smote.1[, -1], y = smote.1$Action)
+names(down.sampled)[names(down.sampled) == 'Class'] <- 'Action'
+data <- down.sampled[, c(12,1,2,3,4,5,6,7,8,9,10,11)]
+summary(data)
+table(data$Class)
+summary(data$Action)
+```
+
+## Feature Correlation
+90+:
+Bytes - Bytes.Sent, Packets, pkts_sent
+Bytes.Sent - pkts_sent
+Bytes.Received - pkts_received
+Packets - pkts_sent, pkts_received
+
+80+:
+Bytes - Bytes.Received
+Bytes.Sent - Packets
+Bytes.Received - Packets
+
+75+
+pkts_sent - pkts_received
+
+```{r}
+cor(data[,c(2:12)])
+```
+
+Splitting the data 75:25 through random sampling
+
+```{r}
+set.seed(45836974, kind="Mersenne-Twister")
+
+perm <- sample(x=nrow(data))
+set1 <- data[which(perm<=3*nrow(data)/4),]
+set2 <- data[which(perm>3*nrow(data)/4),]
+
+head(set1, n=6)
+head(set2, n=6)
+print(summary(set1))
+print(summary(set2))
+```
+Standardizing the variables for KNN classifier, so the distance is not dominated by different scalings
+
+```{r}
+rescale <- function(x1,x2){
+  for(col in 1:ncol(x1)){
+    a <- min(x2[,col])
+    b <- max(x2[,col])
+    x1[,col] <- (x1[,col]-a)/(b-a)
+  }
+  x1
+}
+
+# Creating training and test X matrices, then scaling them.
+x.1.unscaled <- as.matrix(set1[,-1])
+x.1 <- rescale(x.1.unscaled, x.1.unscaled)
+x.2.unscaled <- as.matrix(set2[,-1])
+x.2 <- rescale(x.2.unscaled, x.1.unscaled)
+
+apply(X=x.1, MARGIN=2, FUN=min)
+apply(X=x.1, MARGIN=2, FUN=max)
+apply(X=x.2, MARGIN=2, FUN=min)
+apply(X=x.2, MARGIN=2, FUN=max)
+
+print(summary(x.1))
+print(summary(x.2))
+```
+
+# KNN Classifier (k=1)
+
+```{r}
+library(FNN)
+knnfit <- knn(train=x.1, test=x.2, cl=set1[,1], k=1)
+
+# Create Confusion Matrix and misclass rate
+table(knnfit, set2[,1],  dnn=c("Predicted","Observed"))
+(misclass.knn <- 
+    mean(ifelse(knnfit == set2[,1], yes=0, no=1)))
+(mis.se <- sqrt(misclass.knn*(1-misclass.knn)/nrow(set2)))
+```
+## Tuning K
+```{r}
+kmax <- 40
+
+k <- matrix(c(1:kmax), nrow=kmax)
+runknn <- function(x){
+  knncv.fit <- knn.cv(train=x.1, cl=set1[,1], k=x)
+  # Fitted values are for deleted data from CV
+  mean(ifelse(knncv.fit == set1[,1], yes=0, no=1))
+}
+
+(mis <- apply(X=k, MARGIN=1, FUN=runknn))
+(mis.se <- sqrt(mis*(1-mis)/nrow(set1)))
+
+plot(x=k, y=mis, type="b", ylim=c(0.1,0.4))
+for(mm in c(1:kmax)){
+  lines(x=c(k[mm],k[mm]), y=c(mis[mm]-mis.se[mm], mis[mm]+mis.se[mm]))
+}
+abline(h=min(mis + mis.se), lty="dotted")
+```
+
+```{r}
+# k with the lowest validation error on test data set
+(mink = which.min(mis))
+knnfitmin <- knn(train=x.1, test=x.2, cl=set1[,1], k=mink)
+table(knnfitmin, set2[,1],  dnn=c("Predicted","Observed"))
+(misclass.knnmin <- mean(ifelse(knnfitmin == set2[,1], yes=0, no=1)))
+
+# largest k within 1 SE of minimum validation error
+(serule = max(which(mis<mis[mink]+mis.se[mink])))
+knnfitse <- knn(train=x.1, test=x.2, cl=set1[,1], k=3)
+table(knnfitse, set2[,1],  dnn=c("Predicted","Observed"))
+(misclass.knnse <- mean(ifelse(knnfitse == set2[,1], yes=0, no=1)))
+```
+Optimal K=26 (~root(750)) using minimum CV error.
+
+Applying the 1-SE rule to use the least complex model (k=40)
+
+```{r}
+knnfit.opt <- knn(train=x.1, test=x.2, cl=set1[,1], k=serule)
+
+# Create Confusion Matrix and mis-classification rate
+table(knnfit.opt, set2[,1],  dnn=c("Predicted","Observed"))
+(misclass.knn <- 
+    mean(ifelse(knnfit.opt == set2[,1], yes=0, no=1)))
+(mis.se <- sqrt(misclass.knn*(1-misclass.knn)/nrow(set2)))
+```
+# Logistic Regression
+
+```{r}
+set1.rescale <- data.frame(cbind(rescale(set1[,-1], set1[,-1]), Action=set1$Action))
+set2.rescale <- data.frame(cbind(rescale(set2[,-1], set1[,-1]), Action=set2$Action))
+
+library(nnet)
+mod.fit <- multinom(data=set1.rescale, formula=Action ~ ., 
+                    trace=TRUE)
+library(car)
+Anova(mod.fit)
+
+pred.class.train <- predict(mod.fit, newdata=set1.rescale, 
+                        type="class")
+pred.class.test <- predict(mod.fit, newdata=set2.rescale, 
+                        type="class")
+(mul.misclass.train <- mean(ifelse(pred.class.train == set1$Action, 
+                                   yes=0, no=1)))
+(mul.misclass.test <- mean(ifelse(pred.class.test == set2$Action, 
+                                  yes=0, no=1)))
+
+pred.probs.2 <- predict(mod.fit, newdata=set2.rescale, 
+                        type="probs")
+table(set2$Action, pred.class.test, dnn=c("Obs","Pred"))
+```
+# Logistic Regression (LASSO)
+
+```{r}
+library(glmnet)
+set1.rescale <- data.frame(cbind(rescale(set1[,-1], set1[,-1]), Action=set1$Action))
+set2.rescale <- data.frame(cbind(rescale(set2[,-1], set1[,-1]), Action=set2$Action))
+
+logit.cv <- cv.glmnet(x=as.matrix(set1.rescale[,1:11]), 
+                      y=set1.rescale$Action, family="multinomial")
+
+lascv.pred.train <- predict(object=logit.cv, type="class", 
+                            s=logit.cv$lambda.min, 
+                            newx=as.matrix(set1.rescale[,1:11]))
+lascv.pred.test <- predict(logit.cv, type="class", 
+                           s=logit.cv$lambda.min, 
+                           newx=as.matrix(set2.rescale[,1:11]))
+(lascvmisclass.train <- 
+    mean(ifelse(lascv.pred.train == set1$Action, yes=0, no=1)))
+(lascvmisclass.test <- 
+    mean(ifelse(lascv.pred.test == set2$Action, yes=0, no=1)))
+```
+
+# Linear Discriminant Analysis
+
+```{r}
+library(MASS)
+
+lda.fit <- lda(x=set1[,-1], grouping=set1$Action)
+lda.fit
+class.col <- ifelse(set1$Action=='allow',y=53,n= ifelse(set1$Action=='deny',y=68,n=
+                                                          ifelse(set1$Action=='drop',y=203, n=ifelse(set1$Action=='reset-both',y=150, n=464))))
+class.col
+plot(lda.fit, col=colors()[class.col])
+
+lda.pred.train <- predict(lda.fit, newdata=set1[,-1])$class
+lda.pred.test <- predict(lda.fit, newdata=set2[,-1])$class
+
+# Test set confusion matrix
+table(set2[,1], lda.pred.test, dnn=c("Obs","Pred"))
+
+# in-sample and out-of-sample misclassification error
+(lmisclass.train <- mean(ifelse(lda.pred.train == set1$Action, yes=0, no=1)))
+(lmisclass.test <- mean(ifelse(lda.pred.test == set2$Action, yes=0, no=1)))
+```
+
+# Naive Bayes Model - Without PC
+
+```{r}
+library(klaR)
+
+# Kernel Density Estimation
+NBk <- NaiveBayes(x=x.1, grouping=set1[,1], usekernel=TRUE)
+
+NBk.pred.train <- predict(NBk, newdata=x.1)
+table(NBk.pred.train$class, set1[,1], dnn=c("Predicted","Observed"))
+warnings()
+
+NBk.pred.test <- predict(NBk, newdata=x.2)
+table(NBk.pred.test$class, set2[,1], dnn=c("Predicted","Observed"))
+warnings()
+head(round(NBk.pred.test$posterior))
+
+(NBkmisclass.train <- mean(ifelse(NBk.pred.train$class == set1$Action, yes=0, no=1)))
+(NBkmisclass.test <- mean(ifelse(NBk.pred.test$class == set2$Action, yes=0, no=1)))
+```
+# Naive Bayes, with PC
+
+```{r}
+pc <-  prcomp(x=set1[,-1], scale.=TRUE)
+pc
+xi.1 <- data.frame(pc$x, Action=as.factor(set1$Action))
+xi.2 <- data.frame(predict(pc, newdata=set2), Action=as.factor(set2$Action))
+
+# Kernel Density Estimation
+NBk.pc <- NaiveBayes(x=xi.1[,-12], grouping=xi.1[,12], usekernel=TRUE)
+
+NBkpc.pred.train <- predict(NBk.pc, newdata=xi.1[,-12], type="class")
+table(NBkpc.pred.train$class, xi.1[,12], dnn=c("Predicted","Observed"))
+
+NBkpc.pred.test <- predict(NBk.pc, newdata=xi.2[,-12], type="class")
+table(NBkpc.pred.test$class, xi.2[,12], dnn=c("Predicted","Observed"))
+warnings()
+
+# Error rates
+(NBkPCmisclass.train <- mean(ifelse(NBkpc.pred.train$class == xi.1$Action, yes=0, no=1)))
+(NBkPCmisclass.test <- mean(ifelse(NBkpc.pred.test$class == xi.2$Action, yes=0, no=1)))
+```
+
+# Single Tree
+
+```{r}
+library(rpart)
+
+def.tree <- rpart(data=set1, Action ~ ., method="class")
+printcp(def.tree)
+round(def.tree$cptable[,c(2:5,1)],4)
+
+tree <- rpart(data=set1, Action ~ ., method="class", cp=0)
+printcp(tree)
+round(tree$cptable[,c(2:5,1)],4)
+
+# Find location of minimum error
+cpt = tree$cptable
+minrow <- which.min(cpt[,4])
+# Take geometric mean of cp values at min error and one step up 
+cplow.min <- cpt[minrow,1]
+cpup.min <- ifelse(minrow==1, yes=1, no=cpt[minrow-1,1])
+(cp.min <- sqrt(cplow.min*cpup.min))
+
+# Find smallest row where error is below +1SE
+se.row <- min(which(cpt[,4] < cpt[minrow,4]+cpt[minrow,5]))
+# Take geometric mean of cp values at min error and one step up 
+cplow.1se <- cpt[se.row,1]
+cpup.1se <- ifelse(se.row==1, yes=1, no=cpt[se.row-1,1])
+(cp.1se <- sqrt(cplow.1se*cpup.1se))
+
+# Creating a pruned tree using a selected value of the CP by CV.
+prune.cv.1se <- prune(tree, cp=cp.1se)
+# Creating a pruned tree using a selected value of the CP by CV.
+prune.cv.min <- prune(tree, cp=cp.min)
+
+prune.cv.1se <- prune(tree, cp=cp.1se)
+prune.cv.min <- prune(tree, cp=cp.min)
+
+# Predict results of classification. "Vector" means store class as a number
+pred.train.cv.1se <- predict(prune.cv.1se, newdata=set1[,-1], type="class")
+pred.train.cv.min <- predict(prune.cv.min, newdata=set1[,-1], type="class")
+pred.train.full <- predict(tree, newdata=set1[,-1], type="class")
+
+# Predict results of classification. "Vector" means store class as a number
+pred.test.cv.1se <- predict(prune.cv.1se, newdata=set2[,-1], type="class")
+pred.test.cv.min <- predict(prune.cv.min, newdata=set2[,-1], type="class")
+pred.test.full <- predict(tree, newdata=set2[,-1], type="class")
+
+(misclass.train.cv.1se <- mean(ifelse(pred.train.cv.1se == set1$Action, yes=0, no=1)))
+(misclass.train.cv.min <- mean(ifelse(pred.train.cv.min == set1$Action, yes=0, no=1)))
+(misclass.train.full <- mean(ifelse(pred.train.full == set1$Action, yes=0, no=1)))
+
+(misclass.test.cv.1se <- mean(ifelse(pred.test.cv.1se == set2$Action, yes=0, no=1)))
+(misclass.test.cv.min <- mean(ifelse(pred.test.cv.min == set2$Action, yes=0, no=1)))
+(misclass.test.full <- mean(ifelse(pred.test.full == set2$Action, yes=0, no=1)))
+```
+# Random Forest
+
+```{r}
+library(randomForest)
+
+rf <- randomForest(data=set1, Action~., 
+                      importance=TRUE, keep.forest=TRUE)
+rf
+plot(rf, main="Error rates for different classes")
+
+round(importance(rf),3) # Print out importance measures
+varImpPlot(rf) # Plot of importance measures; more interesting with more variables
+
+# Predict results of classification. 
+pred.rf.train <- predict(rf, newdata=set1, type="response")
+pred.rf.test <- predict(rf, newdata=set2, type="response")
+(misclass.train.rf <- mean(ifelse(pred.rf.train == set1$Action, yes=0, no=1)))
+(misclass.test.rf <- mean(ifelse(pred.rf.test == set2$Action, yes=0, no=1)))
+```
+## Tuning nodesize in Random Forest
+
+```{r}
+reps=5
+all.mtrys = c(6,8,9,10,12)
+all.nodesizes = c(2,3,4,5,6)
+all.pars.rf = expand.grid(mtry = all.mtrys, nodesize = all.nodesizes)
+n.pars = nrow(all.pars.rf)
+M = 5 # Number of times to repeat RF fitting. I.e. Number of OOB errors
+
+### Container to store OOB errors. This will be easier to read if we name
+### the columns.
+all.OOB.rf = array(0, dim = c(M, n.pars))
+names.pars = apply(all.pars.rf, 1, paste0, collapse = "-")
+colnames(all.OOB.rf) = names.pars
+
+for(i in 1:n.pars){
+  ### Progress update
+  print(paste0(i, " of ", n.pars))
+  
+  ### Get tuning parameters for this iteration
+  this.mtry = all.pars.rf[i, "mtry"]
+  this.nodesize = all.pars.rf[i, "nodesize"]
+
+  for(j in 1:M){
+    ### Fit RF, then get and store OOB errors
+    this.fit.rf = randomForest(Action ~ ., data = set1,
+                               mtry = this.mtry, nodesize = this.nodesize)
+    
+    pred.this.rf = predict(this.fit.rf, set1)
+    this.err.rf = mean(set1$Action != pred.this.rf)
+    
+    all.OOB.rf[j, i] = this.err.rf
+  }
+}
+
+all.OOB.rf
+(mean.oob.rf <- round(colMeans(all.OOB.rf), 4))
+min(mean.oob.rf)
+
+rel.OOB.rf = apply(all.OOB.rf, 1, function(W) W/min(W))
+boxplot(t(rel.OOB.rf), las=2,  # las sets the axis label orientation
+        main = "Relative OOB Boxplot")
+```
+## RF with best tuned parameters (mtry=8, nodesize=2)
+
+```{r}
+fit.rf = randomForest(Action ~ ., data = set1, ntree=500,
+                      mtry = 8, nodesize = 2)
+pred.rf.train = predict(fit.rf, set1)
+pred.rf.test = predict(fit.rf, set2)
+table(set2$Action, pred.rf.test, dnn = c("Obs", "Pred"))
+
+(mis.rf.train = mean(set1$Action != pred.rf.train))
+(mis.rf.test = mean(set2$Action != pred.rf.test))
+```
+# Naive Neural Net
+
+```{r}
+y.1 <- class.ind(set1[,1])
+y.2 <- class.ind(set2[,1])
+head(cbind(set1[,1], y.1))
+
+### Fit to set 1, Test on Set 2
+nn.1.0 <- nnet(x=x.1, y=y.1, size=1, maxit=1000, softmax=TRUE)
+# Train error
+p1.nn.1.0m <-predict(nn.1.0, newdata=x.1, type="raw")
+round(head(p1.nn.1.0m), 3)
+p1.nn.1.0 <-predict(nn.1.0, newdata=x.1, type="class")
+table(p1.nn.1.0, as.factor(set1$Action),  dnn=c("Predicted","Observed"))
+(misclass1.1.0 <- mean(ifelse(p1.nn.1.0 == set1$Action, yes=0, no=1)))
+
+# Test set error
+p2.nn.1.0 <-predict(nn.1.0, newdata=x.2, type="class")
+table(p2.nn.1.0, as.factor(set2$Action),  dnn=c("Predicted","Observed"))
+(misclass2.1.0 <- mean(ifelse(p2.nn.1.0 == set2$Action, yes=0, no=1)))
+```
+## Tuning the Neural Net using CV
+
+```{r}
+library(caret)
+# Using 10-fold CV so that training sets are not too small
+#  (Starting with 200 in training set)
+trcon = trainControl(method="repeatedcv", number=10, repeats=2,
+                     returnResamp="all")
+parmgrid = expand.grid(size=c(2,6,9,12),decay= c(0,0.001,0.01,0.1))
+
+tuned.nnet <- train(x=x.1, y=set1$Action, method="nnet", preProcess="range", trace=FALSE, 
+                    tuneGrid=parmgrid, trControl = trcon)
+
+names(tuned.nnet)
+tuned.nnet$results[order(-tuned.nnet$results[,3]),]
+tuned.nnet$bestTune
+head(tuned.nnet$resample)
+tail(tuned.nnet$resample)
+
+# Let's rearrange the data so that we can plot the bootstrap re-samples in 
+#   our usual way, including relative to best
+resamples = reshape(data=tuned.nnet$resample[,-2], idvar=c("size", "decay"), 
+                    timevar="Resample", direction="wide")
+head(resamples)
+(best = apply(X=resamples[,-c(1,2)], MARGIN=2, FUN=max))
+siz.dec <- paste(resamples[,1],"-",resamples[,2])
+
+boxplot.matrix(x=t(t(1-resamples[,-c(1:2)])), use.cols=FALSE, names=siz.dec,
+               main="Misclassification rates for different Size-Decay", las=2)
+
+boxplot.matrix(x=t(t(1-resamples[,-c(1:2)])/(1-best)), use.cols=FALSE, names=siz.dec,
+               main="Relative Misclass rates for different Size-Decay", las=2)
+
+par(mfrow=c(1,2))
+boxplot(t(t(1-resamples[,-c(1:2)])/(1-best)) ~ resamples[,1], xlab="Size", ylab="Relative Error")
+boxplot(t(t(1-resamples[,-c(1:2)])/(1-best)) ~ resamples[,2], xlab="Decay", ylab="Relative Error")
+
+tuned.nnet$ bestTune
+```
+
+## Fitting Neural Network to tuned parameters - size=9, decay=0.001
+```{r}
+x.1.unscaled <- as.matrix(set1[,-1])
+x.2.unscaled <- as.matrix(set2[,-1])
+x.1 <- rescale(x.1.unscaled, x.1.unscaled)
+x.2 <- rescale(x.2.unscaled, x.1.unscaled)
+tuned.nnet$bestTune
+y.1 <- class.ind(set1[,1])
+y.2 <- class.ind(set2[,1])
+
+Mi.final = 1
+
+for(i in 1:10){
+  nn <- nnet(y=y.1, x=x.1, size=tuned.nnet$bestTune$size, decay=tuned.nnet$bestTune$decay, maxit=1000, softmax=TRUE, trace=FALSE)
+  Pi <- predict(nn, newdata=x.1, type="class")
+  Mi <- mean(Pi != as.factor(set1[,1]))
+  
+  print(Mi)
+  
+  if(Mi < Mi.final){ 
+    Mi.final <- Mi
+    nn.final <- nn
+  }
+}
+
+# Train error
+p1.train.nn <-predict(nn.final, newdata=x.1, type="class")
+(misclass.train.nn <- mean(ifelse(p1.train.nn == set1$Action, yes=0, no=1)))
+table(p1.train.nn, as.factor(set1$Action),  dnn=c("Predicted","Observed"))
+
+# Test set error
+p2.test.nn <-predict(nn.final, newdata=x.2, type="class")
+(misclass.test.nn <- mean(ifelse(p2.test.nn == set2$Action, yes=0, no=1)))
+table(p2.test.nn, as.factor(set2$Action),  dnn=c("Predicted","Observed"))
+```
+
+# Support Vector Machines (cost=1, gamma=1)
+
+```{r}
+library(e1071)
+
+svm <- svm(data=set1, Action ~ ., kernel="radial", 
+               gamma=1, cost=1, cross=10)
+summary(svm)
+head(svm$decision.values)
+head(svm$fitted)
+svm$tot.accuracy # Total CV Accuracy
+svm$accuracies # Individual fold accuracies
+
+pred.train <- predict(svm, newdata=set1)
+table(pred.train, set1$Action,  dnn=c("Predicted","Observed"))
+(misclass.train <- mean(ifelse(pred.train == set1$Action, yes=0, no=1)))
+
+pred.test <- predict(svm, newdata=set2)
+table(pred.test, set2$Action,  dnn=c("Predicted","Observed"))
+(misclass.test <- mean(ifelse(pred.test == set2$Action, yes=0, no=1)))
+```
+
+# Tuning SVM parameters, sigma and c for scaling to 10
+
+```{r}
+library(caret)
+
+# Using 10-fold CV so that training sets are not too small
+#  ( Starting with 200 in training set)
+trcon = trainControl(method="repeatedcv", number=10, repeats=2,
+                     returnResamp="all")
+parmgrid = expand.grid(C=10^c(0:5), sigma=10^(-c(5:0)))
+
+tuned.svm <- train(x=set1[,-1], y=set1$Action, method="svmRadial", 
+                    preProcess=c("center","scale"), trace=FALSE, 
+                    tuneGrid=parmgrid, trControl = trcon)
+tuned.svm$bestTune$sigma
+names(tuned.svm)
+
+tuned.svm$results[order(-tuned.nnet$results[,3]),]
+head(tuned.svm$resample)
+tail(tuned.svm$resample)
+
+# Let's rearrange the data so that we can plot the bootstrap resamples in 
+#   our usual way, including relative to best
+resamples = reshape(data=tuned.svm$resample[,-2], idvar=c("C", "sigma"), 
+                    timevar="Resample", direction="wide")
+head(resamples)
+(misclass_rates <- t(t(1-resamples[,-c(1:2)])))
+(best = apply(X=resamples[,-c(1,2)], MARGIN=2, FUN=max))
+(C.sigma <- paste(log10(resamples[,1]),"-",log10(resamples[,2])))
+
+boxplot.matrix(x=t(t(1-resamples[,-c(1:2)])), use.cols=FALSE, names=C.sigma,
+               main="Misclassification rates for different Cost-Gamma", las=2)
+
+boxplot.matrix(x=t(t(1-resamples[,-c(1:2)])/(1-best)), use.cols=FALSE, names=C.sigma,
+               main="Relative Misclass rates for different Cost-Gamma", las=2)
+
+par(mfrow=c(1,2))
+boxplot(t(t(1-resamples[,-c(1:2)])/(1-best)) ~ resamples[,1], xlab="C", ylab="Relative Error")
+boxplot(t(t(1-resamples[,-c(1:2)])/(1-best)) ~ resamples[,2], xlab="Sigma", ylab="Relative Error")
+```
+
+# Refit SVM using tuned parameters - gamma=-1, cost=0
+
+```{r}
+tuned.svm$bestTune
+library(e1071)
+svm.tun <- svm(data=set1, Action ~ ., kernel="radial", 
+               gamma=tuned.svm$bestTune$C, cost=tuned.svm$bestTune$sigma)
+summary(svm.tun)
+head(svm.tun$decision.values)
+head(svm.tun$fitted)
+
+pred1.tun <- predict(svm.tun, newdata=set1)
+table(pred1.tun, set1$Action,  dnn=c("Predicted","Observed"))
+(misclass1.tun <- mean(ifelse(pred1.tun == set1$Action, yes=0, no=1)))
+
+pred2.tun <- predict(svm.tun, newdata=set2)
+table(pred2.tun, set2$Action,  dnn=c("Predicted","Observed"))
+(misclass2.tun <- mean(ifelse(pred2.tun == set2$Action, yes=0, no=1)))
+```
