@@ -172,7 +172,7 @@ The range of parameters used in the model comparison:
 
 | | Train Error | Test Error | 
 |----| ---- | ---|
-| Tuned KNN (k1se=3) | 0.148 | |
+| Tuned KNN (k1se=3) | | 0.148 |
 | Logistic Regression | 0.134 | 0.197 |
 | Logistic Regression (LASSO) | 0.134 | 0.148 |
 | Linear Discriminant Analysis | 0.25 | 0.33 |
